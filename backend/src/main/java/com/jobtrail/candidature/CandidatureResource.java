@@ -3,6 +3,7 @@ package com.jobtrail.candidature;
 import java.util.List;
 
 import jakarta.transaction.Transactional;
+import jakarta.validation.Valid;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
@@ -27,7 +28,7 @@ public class CandidatureResource {
 
   @POST
   @Transactional
-  public Response create(Candidature c){
+  public Response create(@Valid Candidature c){
     c.persist();
     return Response.status(Response.Status.CREATED).entity(c).build();
   }
