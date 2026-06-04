@@ -17,6 +17,7 @@
 - [P1 — Premier endpoint REST avec Quarkus](#p1--premier-endpoint-rest-avec-quarkus)
 - [P2 — PostgreSQL et Hibernate Panache](#p2--postgresql-et-hibernate-panache)
 - [P3 — Sécurité (JWT, rôles, OWASP)](#p3--sécurité-jwt-rôles-owasp)
+- [P4 — Tests automatisés](#p4--tests-automatisés)
 - [Annexe — Principes de conception](#annexe--principes-de-conception)
 - [Annexe — Design patterns](#annexe--design-patterns)
 - [Annexe — Stratégie Docker](#annexe--stratégie-docker)
@@ -751,6 +752,401 @@ curl -i -X POST http://localhost:8080/api/auth/login \
 
 Colle le token sur **https://jwt.io** : header (`RS256`) + payload (claims en clair) → preuve que le payload est **encodé, pas chiffré**.
 
+### Étape 4 — Protéger les endpoints (RBAC)
+
+Jusqu'ici, **n'importe qui** peut appeler `/api/candidatures`. On va exiger un token valide, et restreindre selon le **rôle** (RBAC = *Role-Based Access Control*).
+
+#### Les deux codes d'erreur à ne jamais confondre
+
+| Code | Nom | Signification | Cas |
+|---|---|---|---|
+| **401** | *Unauthorized* | « je ne sais pas **qui** tu es » | token absent, expiré, ou signature invalide |
+| **403** | *Forbidden* | « je sais qui tu es, mais tu **n'as pas le droit** » | token valide mais rôle insuffisant |
+
+> Mnémotechnique : **401 = authentification** (manquante), **403 = autorisation** (refusée). Mal nommé « Unauthorized » par la spec HTTP, le 401 concerne en réalité l'*authentification*.
+
+#### Les annotations de sécurité
+
+Issues de `jakarta.annotation.security` (standard, fonctionnent aussi en Spring) :
+
+| Annotation | Effet | Import |
+|---|---|---|
+| `@PermitAll` | accès **public** (aucun token requis) | `jakarta.annotation.security.PermitAll` |
+| `@Authenticated` | exige un **token valide** (n'importe quel rôle) | `io.quarkus.security.Authenticated` |
+| `@RolesAllowed("ADMIN")` | exige un token **+ un rôle précis** | `jakarta.annotation.security.RolesAllowed` |
+| `@DenyAll` | bloque tout le monde | `jakarta.annotation.security.DenyAll` |
+
+C'est **`smallrye-jwt`** qui fait le travail en amont : il vérifie la **signature** (clé publique), l'**expiration** (`exp`) et l'**issuer** (`iss`) ; puis lit le claim `groups` pour confronter aux rôles autorisés. Tu n'écris **aucun** code de vérification.
+
+#### Garder les endpoints d'auth publics
+
+`register` et `login` doivent rester accessibles **sans** token (sinon impossible de se connecter !). On l'explicite — bonne pratique de lisibilité — en annotant la classe `AuthResource` :
+
+```java
+import jakarta.annotation.security.PermitAll;
+
+@Path("/api/auth")
+@PermitAll   // tout le monde peut s'inscrire / se connecter
+@Consumes(MediaType.APPLICATION_JSON)
+@Produces(MediaType.APPLICATION_JSON)
+public class AuthResource { /* ... */ }
+```
+
+> 💡 **« Deny by default » (principe de moindre privilège).** Par défaut, un endpoint Quarkus non annoté est **public**. La posture sécurisée est l'inverse : **tout interdire sauf ce qu'on ouvre explicitement**. On peut forcer ça globalement dans `application.properties` :
+> ```properties
+> quarkus.http.auth.permission.authenticated.paths=/api/*
+> quarkus.http.auth.permission.authenticated.policy=authenticated
+> quarkus.http.auth.permission.public.paths=/api/auth/*
+> quarkus.http.auth.permission.public.policy=permit
+> ```
+> Ainsi tout `/api/*` exige un token, sauf `/api/auth/*`. C'est un excellent point d'entretien : *« je sécurise par défaut, j'ouvre par exception »*.
+
+#### Protéger `CandidatureResource`
+
+On exige un token authentifié sur toute la ressource, et on réserve la **suppression** aux `ADMIN` (démonstration du RBAC vertical) :
+
+```java
+import io.quarkus.security.Authenticated;
+import jakarta.annotation.security.RolesAllowed;
+
+@Path("/api/candidatures")
+@Authenticated   // tout endpoint de cette classe exige un token valide
+@Produces(MediaType.APPLICATION_JSON)
+@Consumes(MediaType.APPLICATION_JSON)
+public class CandidatureResource {
+
+    // list(), findById(), create() : hérités du @Authenticated de la classe
+
+    @DELETE
+    @Path("/{id}")
+    @RolesAllowed("ADMIN")   // ⬅ seul un ADMIN peut supprimer
+    @Transactional
+    public void delete(@PathParam("id") Long id) {
+        if (!Candidature.deleteById(id))
+            throw new NotFoundException("Candidature " + id + " introuvable");
+    }
+}
+```
+
+Une annotation sur **une méthode** l'emporte sur celle de la **classe** : ici `delete` passe de « authentifié » à « ADMIN uniquement ».
+
+### Étape 5 — Lire l'utilisateur courant et cloisonner ses données
+
+Sécuriser par rôle ne suffit pas : aujourd'hui, **un USER connecté voit les candidatures de TOUS les autres**. C'est la faille n°1 d'OWASP — **Broken Access Control**, et sa variante **IDOR** (*Insecure Direct Object Reference* : accéder à l'objet d'autrui en devinant son `id`). On va **cloisonner** : chaque utilisateur ne voit que **ses** candidatures.
+
+#### Récupérer l'identité depuis le token
+
+On **injecte** le JWT pour lire qui est connecté :
+
+```java
+import org.eclipse.microprofile.jwt.JsonWebToken;
+import jakarta.inject.Inject;
+
+@Inject
+JsonWebToken jwt;   // le token de la requête courante
+```
+
+`jwt.getName()` renvoie le claim `upn` → le **username** du connecté. (Équivalent Spring : `SecurityContextHolder.getContext().getAuthentication()`.)
+
+#### Lier chaque candidature à son propriétaire
+
+Ajoute un champ `owner` à l'entité 📄 `Candidature.java` :
+
+```java
+public String owner;   // username du propriétaire (rempli côté serveur, jamais par le client)
+```
+
+Puis adapte le CRUD pour filtrer/contrôler par propriétaire :
+
+```java
+    @GET
+    public List<Candidature> list() {
+        return Candidature.list("owner", jwt.getName());   // seulement les miennes
+    }
+
+    @GET
+    @Path("/{id}")
+    public Candidature findById(@PathParam("id") Long id) {
+        Candidature c = Candidature.findById(id);
+        // pas à moi → 404 (et non 403) pour ne pas révéler que l'objet existe
+        if (c == null || !c.owner.equals(jwt.getName()))
+            throw new NotFoundException("Candidature " + id + " introuvable");
+        return c;
+    }
+
+    @POST
+    @Transactional
+    public Response create(@Valid Candidature c) {
+        c.owner = jwt.getName();   // le serveur fixe le propriétaire, on ne fait pas confiance au client
+        c.persist();
+        return Response.status(Response.Status.CREATED).entity(c).build();
+    }
+```
+
+Deux réflexes de sécurité majeurs ici :
+- **Le serveur impose `owner`** depuis le token, il ne le lit **jamais** dans le corps de la requête (sinon n'importe qui s'attribuerait les candidatures d'un autre).
+- **On renvoie 404 plutôt que 403** quand l'objet ne t'appartient pas : un 403 confirmerait que l'`id` existe (re-fuite d'information, cf. énumération). Renvoyer 404 ne révèle rien.
+
+> **Vocabulaire d'entretien :** contrôle d'accès **vertical** (par rôle : USER vs ADMIN) vs **horizontal** (entre utilisateurs de même rôle : mes données vs les tiennes). `@RolesAllowed` gère le vertical ; le filtre `owner` gère l'horizontal. Les deux sont nécessaires.
+
+### Étape 6 — Tester la chaîne complète
+
+```bash
+# 1. Sans token → 401
+curl -i http://localhost:8080/api/candidatures
+
+# 2. Login et capture du token dans une variable shell
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"pierre","password":"secret123"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+# 3. Avec token → 200 (et liste filtrée sur mes candidatures)
+curl -i http://localhost:8080/api/candidatures \
+  -H "Authorization: Bearer $TOKEN"
+
+# 4. Création (owner fixé automatiquement) → 201
+curl -i -X POST http://localhost:8080/api/candidatures \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"entreprise":"Stripe","poste":"Backend Quarkus","statut":"CANDIDATE"}'
+
+# 5. Suppression en tant que USER → 403 (réservé ADMIN)
+curl -i -X DELETE http://localhost:8080/api/candidatures/1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Le header **`Authorization: Bearer <token>`** est la convention standard pour transmettre un JWT. *(« Bearer » = « au porteur » : quiconque détient le token a les droits → d'où l'importance du HTTPS en prod pour qu'il ne soit pas intercepté.)*
+
+## P3 — Synthèse OWASP
+
+Le **OWASP Top 10** est le classement de référence des risques de sécurité web. Voici comment chaque choix de JobTrail répond aux catégories 2021 — un tableau **directement récitable en entretien** :
+
+| Risque OWASP (2021) | Notre parade dans JobTrail |
+|---|---|
+| **A01 — Broken Access Control** (n°1) | `@RolesAllowed` (vertical) + filtre `owner` (horizontal) + 404 anti-IDOR |
+| **A02 — Cryptographic Failures** | mots de passe **hachés BCrypt** (jamais en clair) ; JWT signé **RS256** ; clés hors du dépôt |
+| **A03 — Injection** | requêtes **paramétrées** Panache/JPA (pas de SQL concaténé) + **Bean Validation** sur les entrées |
+| **A04 — Insecure Design** | séparation **entité / DTO**, *fail fast* par validation, *deny by default* |
+| **A05 — Security Misconfiguration** | secrets externalisés, `deny by default`, messages d'erreur neutres |
+| **A07 — Identification & Auth Failures** | JWT à **expiration courte**, **anti-énumération** sur login, hash robuste |
+| **A08 — Software & Data Integrity** | token **signé** → toute altération du payload invalide la signature |
+| **A09 — Logging & Monitoring** | *(à venir P6 : journaliser les échecs d'auth sans logguer de secret)* |
+
+> **Note CORS (à venir avec Angular).** Quand l'app Angular (origine `http://localhost:4200`) appellera l'API (`:8080`), le navigateur appliquera la *Same-Origin Policy*. Il faudra configurer **CORS** côté Quarkus (`quarkus.http.cors=true`) pour autoriser explicitement l'origine du front. À traiter au branchement du frontend.
+
+---
+
+## P4 — Tests automatisés
+
+Écrire des tests, ce n'est pas « vérifier une fois » : c'est un **filet de sécurité permanent**. À chaque modification, ils rejouent en quelques secondes et te disent si tu as **cassé quelque chose** (régression). C'est non négociable en environnement pro, et **presque toujours évoqué en entretien**.
+
+### Vocabulaire (les concepts à dégainer en entretien)
+
+**La pyramide de tests** — beaucoup de tests rapides en bas, peu de tests lents en haut :
+
+```
+        /\        E2E (end-to-end)      ← lents, fragiles, peu nombreux
+       /  \         (UI complète)
+      /----\      Intégration / composant ← bootent l'app, la vraie DB
+     /      \        (@QuarkusTest)
+    /--------\    Unitaires              ← ultra-rapides, isolés, très nombreux
+   /__________\     (logique pure, JUnit seul)
+```
+
+| Type | Périmètre | Vitesse | Dans JobTrail |
+|---|---|---|---|
+| **Unitaire** | une classe/méthode isolée, sans framework | ⚡️ ms | une règle métier pure |
+| **Intégration / composant** | l'app bootée, vrais beans CDI + DB de test | 🐢 s | endpoints REST + sécurité |
+| **E2E** | toute la chaîne (front → back → DB) | 🐌 | plus tard, via le front |
+
+**Les principes FIRST** d'un bon test : **F**ast (rapide), **I**ndependent (aucun test n'en dépend d'un autre), **R**epeatable (même résultat à chaque exécution), **S**elf-validating (réussit ou échoue, sans interprétation manuelle), **T**imely (écrit au bon moment, idéalement tôt).
+
+**La structure AAA** (= *Given-When-Then*) : **Arrange** (préparer le contexte) → **Act** (exécuter l'action) → **Assert** (vérifier le résultat). REST Assured calque exactement ce découpage.
+
+**Les *test doubles*** (objets de remplacement pour isoler ce qu'on teste) :
+- **Mock** : objet simulé dont on **vérifie les interactions** et on **programme les réponses** (Mockito).
+- **Stub** : renvoie des valeurs prédéfinies, sans vérification.
+- **Fake** : implémentation allégée mais fonctionnelle (ex. base en mémoire).
+
+### Étape 1 — L'outillage
+
+Quarkus fournit déjà `quarkus-junit5` (le moteur **JUnit 5 / Jupiter**) et **REST Assured** (test d'API HTTP) dans un projet neuf. On ajoute de quoi tester la **sécurité** et de quoi **mocker**.
+
+⚠️ Ces trois-là sont des **librairies de support de test**, pas des extensions cataloguées → `quarkus extension add` les refuse (« not matched in the catalog »). On les ajoute **à la main** dans 📄 `backend/pom.xml`, juste avant `</dependencies>` :
+
+```xml
+<dependency>
+    <groupId>io.quarkus</groupId>
+    <artifactId>quarkus-test-security</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>io.quarkus</groupId>
+    <artifactId>quarkus-test-security-jwt</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>io.quarkus</groupId>
+    <artifactId>quarkus-junit5-mockito</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+- **Pas de `<version>`** : gérée par le **BOM Quarkus** (bloc `dependencyManagement`) → versions centralisées, pas de conflit (du DRY appliqué aux dépendances).
+- **`<scope>test</scope>`** : disponibles uniquement pour `src/test/`, jamais embarquées en prod. C'est la raison pour laquelle ce ne sont pas des « extensions » : une extension fait partie du **runtime**, pas une dépendance de test.
+
+| Outil | Rôle | Équivalent connu |
+|---|---|---|
+| **JUnit 5** | lance les tests (`@Test`, assertions, cycle de vie) | Jest/Vitest côté JS |
+| **REST Assured** | appelle tes endpoints en style *Given-When-Then* | Supertest |
+| **Hamcrest** | *matchers* lisibles (`is`, `equalTo`, `hasSize`) | les matchers de Jest |
+| **`quarkus-test-security`** | simuler un utilisateur connecté (`@TestSecurity`) sans vrai token | — |
+| **Mockito** (`@InjectMock`) | remplacer une dépendance par un mock | `jest.mock()` |
+
+> 📁 **Convention de rangement :** les tests vivent dans `src/test/java/`, en **miroir** de `src/main/java/` (même package). Une classe `CandidatureResource` → un test `CandidatureResourceTest` dans `src/test/java/com/jobtrail/candidature/`. Maven exécute automatiquement les classes finissant par `Test`.
+
+### Étape 2 — Premier test d'endpoint (REST Assured)
+
+📄 `backend/src/test/java/com/jobtrail/candidature/CandidatureResourceTest.java` :
+
+```java
+package com.jobtrail.candidature;
+
+import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import static io.restassured.RestAssured.given;
+
+@QuarkusTest   // démarre l'application Quarkus pour la durée des tests
+class CandidatureResourceTest {
+
+    @Test
+    @DisplayName("Sans token, l'accès aux candidatures est refusé (401)")
+    void sansToken_renvoie401() {
+        given()                                  // Arrange : aucune authentification
+            .when().get("/api/candidatures")     // Act : appel HTTP
+            .then().statusCode(401);             // Assert : on attend un 401
+    }
+}
+```
+
+- **`@QuarkusTest`** boote l'application **une fois** pour toute la classe (vrais beans, vraie DB de test). C'est un test d'**intégration**.
+- **`given().when().then()`** : la triade *Given-When-Then* — exactement le pattern AAA.
+- **`@DisplayName`** : un libellé lisible dans le rapport de test (bonne pratique de documentation vivante).
+
+Lancer les tests : `./mvnw test` (ou `quarkus test` en mode continu, qui relance à chaque sauvegarde).
+
+### Étape 3 — Tester la sécurité (`@TestSecurity`)
+
+Plutôt que de générer un vrai JWT dans chaque test, on **simule** l'utilisateur connecté avec `@TestSecurity` (+ `@JwtSecurity` pour peupler le claim `upn` que lit `jwt.getName()`) :
+
+```java
+import io.quarkus.test.security.TestSecurity;
+import io.quarkus.test.security.jwt.JwtSecurity;
+import io.smallrye.jwt.build.Jwt;            // si besoin de claims supplémentaires
+import org.junit.jupiter.api.Test;
+
+import static io.restassured.RestAssured.given;
+
+    @Test
+    @TestSecurity(user = "pierre", roles = "USER")
+    @JwtSecurity(claims = @io.quarkus.test.security.jwt.Claim(key = "upn", value = "pierre"))
+    @DisplayName("Un USER authentifié peut lister ses candidatures (200)")
+    void userAuthentifie_peutLister() {
+        given()
+            .when().get("/api/candidatures")
+            .then().statusCode(200);
+    }
+
+    @Test
+    @TestSecurity(user = "pierre", roles = "USER")
+    @DisplayName("Un USER ne peut pas supprimer (403, réservé ADMIN)")
+    void user_nePeutPasSupprimer() {
+        given()
+            .when().delete("/api/candidatures/1")
+            .then().statusCode(403);   // autorisé authentifié, mais rôle insuffisant
+    }
+
+    @Test
+    @TestSecurity(user = "boss", roles = "ADMIN")
+    @DisplayName("Un ADMIN peut supprimer")
+    void admin_peutSupprimer() {
+        given()
+            .when().delete("/api/candidatures/999")  // id inexistant
+            .then().statusCode(404);   // accès autorisé : on passe le RBAC, l'objet n'existe pas
+    }
+```
+
+Ce trio teste **les trois issues du contrôle d'accès** vues en P3 : **401** (pas de `@TestSecurity` → pas authentifié), **403** (authentifié mais mauvais rôle), **succès** (bon rôle). Noter le cas ADMIN : le `404` prouve qu'on a **franchi le RBAC** (sinon on aurait eu 403 avant d'atteindre la logique).
+
+### Étape 4 — Tester l'écriture sans polluer la base (`@TestTransaction`)
+
+Un test qui insère en base doit **ne rien laisser derrière lui** (principe *Independent/Repeatable* de FIRST). `@TestTransaction` ouvre une transaction **annulée (rollback) à la fin du test** :
+
+```java
+import io.quarkus.test.TestTransaction;
+
+    @Test
+    @TestSecurity(user = "pierre", roles = "USER")
+    @JwtSecurity(claims = @io.quarkus.test.security.jwt.Claim(key = "upn", value = "pierre"))
+    @TestTransaction   // tout ce qui est écrit ici est annulé après le test
+    @DisplayName("Création d'une candidature → 201 et owner = utilisateur courant")
+    void create_renvoie201() {
+        given()
+            .contentType("application/json")
+            .body("""
+                {"entreprise":"Stripe","poste":"Backend Quarkus","statut":"CANDIDATE"}
+                """)
+            .when().post("/api/candidatures")
+            .then().statusCode(201)
+                   .body("owner", org.hamcrest.Matchers.is("pierre"));  // le serveur a bien fixé owner
+    }
+```
+
+L'assertion `.body("owner", is("pierre"))` vérifie une **règle de sécurité** (le serveur impose `owner`, pas le client) — un test qui documente une intention métier.
+
+### Étape 5 — Test unitaire pur (sans booter Quarkus)
+
+Pour une **logique isolée**, pas besoin de `@QuarkusTest` (lent) : un simple test JUnit suffit, instantané. Exemple sur une méthode hypothétique :
+
+```java
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class StatutTest {
+    @Test
+    void unNouveauStatutEstValide() {
+        assertTrue(Statut.estValide("CANDIDATE"));
+        assertFalse(Statut.estValide("n'importe quoi"));
+    }
+}
+```
+
+> **Le bon réflexe (et la pyramide de tests) :** teste la **logique métier** par des tests unitaires rapides, et réserve les `@QuarkusTest` (plus lents) aux **parcours d'intégration** (endpoint + sécurité + DB). C'est ce qui garde une suite de tests rapide tout en couvrant l'essentiel.
+
+### Étape 6 — Mocker une dépendance (`@InjectMock`)
+
+Quand on aura une couche **Service**, on pourra la **mocker** pour tester la Resource isolément, sans toucher la vraie base :
+
+```java
+import io.quarkus.test.junit.mockito.InjectMock;
+import static org.mockito.Mockito.when;
+
+@InjectMock
+CandidatureService service;   // remplace le vrai bean par un mock
+
+@Test
+void exemple() {
+    when(service.findAllForCurrentUser()).thenReturn(List.of(/* ... */));  // on programme la réponse
+    // ... l'endpoint utilisera le mock au lieu de la vraie logique
+}
+```
+
+> **À retenir :** un **mock** isole l'unité testée de ses dépendances → test plus rapide, ciblé, déterministe. C'est l'application directe du **D de SOLID** (on dépend d'une abstraction → on peut la remplacer par un mock). *(Pour mocker les méthodes statiques de Panache, Quarkus fournit `PanacheMock` — utile si tu testes une Resource active-record sans DB.)*
+
+> **Dev Services en test.** Au lancement des `@QuarkusTest`, Quarkus démarre **automatiquement une PostgreSQL jetable dans Docker** (via Testcontainers) : tes tests d'intégration tournent contre une **vraie base**, créée puis détruite, sans config. C'est un énorme argument cloud-native — *« mes tests s'exécutent contre une vraie DB éphémère, reproductible partout, y compris en CI »*.
+
 ---
 
 ## Annexe — Principes de conception
@@ -846,6 +1242,7 @@ Docker sert à **deux choses distinctes** :
 | **P1** | Premier projet Quarkus + endpoint REST | ✅ |
 | **P2** | PostgreSQL (Docker) + Hibernate Panache + CRUD + validation | ✅ |
 | **P3** | Sécurité (JWT, rôles, OWASP) | 🚧 en cours |
-| **P4** | Frontend Angular (login + liste) | ⏳ |
-| **P5** | Frontend CRUD + tableau de bord | ⏳ |
-| **P6** | DevOps cloud-native (Docker app, CI/CD, build natif) | ⏳ |
+| **P4** | Tests automatisés (@QuarkusTest, REST Assured, @TestSecurity) | 🚧 en cours |
+| **P5** | Frontend Angular (login + liste) | ⏳ |
+| **P6** | Frontend CRUD + tableau de bord | ⏳ |
+| **P7** | DevOps cloud-native (Docker app, CI/CD, build natif) | ⏳ |

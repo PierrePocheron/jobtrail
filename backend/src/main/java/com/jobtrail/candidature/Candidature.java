@@ -19,4 +19,6 @@ public class Candidature extends PanacheEntity{
 
   @Size(max = 30)
   public String statut;
+
+  public String owner;
 }
